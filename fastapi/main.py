@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import List, Optional
 import sqlite3
@@ -101,11 +102,12 @@ async def startup_event():
 
 # Rotas da API
 
-@app.get("/")
+@app.get("/api/")
 async def root():
-    """Rota raiz da API"""
+    """Informações da API"""
     return {
         "mensagem": "Bem-vindo à API CRUD com FastAPI!",
+        "versao": "1.0.0",
         "docs": "/docs",
         "redoc": "/redoc"
     }
@@ -216,3 +218,10 @@ async def deletar_produto(produto_id: int):
 async def health_check():
     """Endpoint para verificar a saúde da API"""
     return {"status": "ok", "mensagem": "API funcionando corretamente"}
+
+
+# Servir o frontend React (após build)
+# Descomente as linhas abaixo após fazer o build do React (npm run build)
+# frontend_path = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
+# if os.path.exists(frontend_path):
+#     app.mount("/", StaticFiles(directory=frontend_path, html=True), name="frontend")
