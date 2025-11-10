@@ -31,7 +31,7 @@ fastapi/
 
 1. **Clone o repositório:**
 ```powershell
-git clone <url-do-repositorio>
+git clone https://github.com/victor-delfino/fastapi
 cd fastapi
 ```
 

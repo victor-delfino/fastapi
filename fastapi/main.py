@@ -1,11 +1,19 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import List, Optional
-import sqlite3
-from contextlib import contextmanager
+from datetime import timedelta
 import os
+
+# Importar módulos de autenticação e banco de dados
+from auth import (
+    User, UserCreate, UserLogin, UserUpdate, Token,
+    create_access_token, get_current_user,
+    get_password_hash, authenticate_user, create_user_in_db, update_user_in_db,
+    ACCESS_TOKEN_EXPIRE_MINUTES
+)
+from database import init_database, get_db_connection
 
 # Criar a aplicação FastAPI
 app = FastAPI(
@@ -22,9 +30,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Nome do banco de dados
-DB_NAME = "database.db"
 
 # Modelos Pydantic
 class ProdutoBase(BaseModel):
@@ -44,60 +49,20 @@ class ProdutoUpdate(BaseModel):
 
 class Produto(ProdutoBase):
     id: int
-
+    user_id: int
+    
     class Config:
         from_attributes = True
-
-
-# Gerenciador de contexto para conexão com o banco de dados
-@contextmanager
-def get_db():
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        raise e
-    finally:
-        conn.close()
-
-
-# Inicializar banco de dados
-def init_db():
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS produtos (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                nome TEXT NOT NULL,
-                descricao TEXT,
-                preco REAL NOT NULL,
-                estoque INTEGER NOT NULL
-            )
-        """)
-        
-        # Inserir dados de exemplo se a tabela estiver vazia
-        cursor.execute("SELECT COUNT(*) as count FROM produtos")
-        if cursor.fetchone()["count"] == 0:
-            produtos_exemplo = [
-                ("Notebook", "Notebook Dell Inspiron 15", 3500.00, 10),
-                ("Mouse", "Mouse sem fio Logitech", 89.90, 50),
-                ("Teclado", "Teclado mecânico RGB", 299.90, 25),
-                ("Monitor", "Monitor LG 24 polegadas", 899.00, 15),
-                ("Webcam", "Webcam Full HD 1080p", 249.00, 30)
-            ]
-            cursor.executemany(
-                "INSERT INTO produtos (nome, descricao, preco, estoque) VALUES (?, ?, ?, ?)",
-                produtos_exemplo
-            )
 
 
 # Evento de inicialização
 @app.on_event("startup")
 async def startup_event():
-    init_db()
+    init_database()
+    
+    # Não inserir produtos de exemplo automaticamente
+    # Cada usuário criará seus próprios produtos após o registro
+    print("🚀 API iniciada com sucesso!")
 
 
 # Rotas da API
@@ -113,59 +78,230 @@ async def root():
     }
 
 
+# ==================== ROTAS DE AUTENTICAÇÃO ====================
+
+@app.post("/auth/register", response_model=Token, status_code=201)
+async def register(user_data: UserCreate):
+    """Registrar um novo usuário"""
+    print(f"📝 Registro iniciado para: {user_data.username}")
+    
+    # Validações básicas
+    if len(user_data.username) < 3:
+        raise HTTPException(status_code=400, detail="Username deve ter pelo menos 3 caracteres")
+    
+    if len(user_data.password) < 6:
+        raise HTTPException(status_code=400, detail="Senha deve ter pelo menos 6 caracteres")
+    
+    if "@" not in user_data.email:
+        raise HTTPException(status_code=400, detail="Email inválido")
+    
+    print(f"✅ Validações passaram, gerando hash da senha...")
+    
+    # Hash da senha
+    password_hash = get_password_hash(user_data.password)
+    
+    print(f"✅ Hash gerado, criando usuário no banco...")
+    
+    # Criar usuário no banco
+    user_id = create_user_in_db(user_data.username, user_data.email, password_hash)
+    
+    print(f"✅ Usuário criado com ID: {user_id}, gerando token...")
+    
+    # Criar token JWT
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": str(user_id)},  # Converter para string!
+        expires_delta=access_token_expires
+    )
+    
+    user = User(id=user_id, username=user_data.username, email=user_data.email)
+    
+    print(f"🎉 Registro completo para: {user_data.username}")
+    
+    return Token(
+        access_token=access_token,
+        token_type="bearer",
+        user=user
+    )
+
+
+@app.post("/auth/login", response_model=Token)
+async def login(credentials: UserLogin):
+    """Fazer login e obter token JWT"""
+    user = authenticate_user(credentials.username, credentials.password)
+    
+    if not user:
+        raise HTTPException(
+            status_code=401,
+            detail="Username ou senha incorretos"
+        )
+    
+    # Criar token JWT
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": str(user.id)},  # Converter para string!
+        expires_delta=access_token_expires
+    )
+    
+    print(f"🔑 Token gerado para usuário {user.username} (id={user.id})")
+    print(f"   Token: {access_token[:30]}...")
+    
+    return Token(
+        access_token=access_token,
+        token_type="bearer",
+        user=user
+    )
+
+
+@app.get("/auth/me", response_model=User)
+async def get_me(current_user: User = Depends(get_current_user)):
+    """Obter informações do usuário atual"""
+    return current_user
+
+
+@app.put("/auth/me", response_model=User)
+async def update_me(
+    user_data: UserUpdate,
+    current_user: User = Depends(get_current_user)
+):
+    """Atualizar informações do usuário atual"""
+    print(f"📝 Atualizando usuário: {current_user.username}")
+    
+    # Validar email
+    if "@" not in user_data.email:
+        raise HTTPException(status_code=400, detail="Email inválido")
+    
+    # Validar senha se estiver alterando
+    if user_data.new_password:
+        if len(user_data.new_password) < 6:
+            raise HTTPException(
+                status_code=400,
+                detail="Nova senha deve ter pelo menos 6 caracteres"
+            )
+    
+    try:
+        updated_user = update_user_in_db(
+            user_id=current_user.id,
+            email=user_data.email,
+            current_password=user_data.current_password,
+            new_password=user_data.new_password
+        )
+        print(f"✅ Usuário atualizado: {updated_user.username}")
+        return updated_user
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Erro ao atualizar usuário: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao atualizar usuário: {str(e)}"
+        )
+
+
+
+# ==================== ROTAS DE PRODUTOS (PROTEGIDAS) ====================
+
+
 @app.get("/produtos", response_model=List[Produto])
-async def listar_produtos():
-    """Listar todos os produtos"""
-    with get_db() as conn:
+async def listar_produtos(current_user: User = Depends(get_current_user)):
+    """Listar apenas os produtos do usuário autenticado"""
+    with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM produtos ORDER BY id")
+        cursor.execute(
+            "SELECT id, nome, descricao, preco, estoque, user_id FROM produtos WHERE user_id = ? ORDER BY id",
+            (current_user.id,)
+        )
         produtos = cursor.fetchall()
-        return [dict(produto) for produto in produtos]
+        return [
+            {
+                "id": p[0],
+                "nome": p[1],
+                "descricao": p[2],
+                "preco": p[3],
+                "estoque": p[4],
+                "user_id": p[5]
+            }
+            for p in produtos
+        ]
 
 
 @app.get("/produtos/{produto_id}", response_model=Produto)
-async def obter_produto(produto_id: int):
-    """Obter um produto específico por ID"""
-    with get_db() as conn:
+async def obter_produto(produto_id: int, current_user: User = Depends(get_current_user)):
+    """Obter um produto específico (apenas se pertencer ao usuário)"""
+    with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM produtos WHERE id = ?", (produto_id,))
+        cursor.execute(
+            "SELECT id, nome, descricao, preco, estoque, user_id FROM produtos WHERE id = ? AND user_id = ?",
+            (produto_id, current_user.id)
+        )
         produto = cursor.fetchone()
         
         if not produto:
-            raise HTTPException(status_code=404, detail="Produto não encontrado")
+            raise HTTPException(
+                status_code=404,
+                detail="Produto não encontrado ou você não tem permissão para acessá-lo"
+            )
         
-        return dict(produto)
+        return {
+            "id": produto[0],
+            "nome": produto[1],
+            "descricao": produto[2],
+            "preco": produto[3],
+            "estoque": produto[4],
+            "user_id": produto[5]
+        }
 
 
 @app.post("/produtos", response_model=Produto, status_code=201)
-async def criar_produto(produto: ProdutoCreate):
-    """Criar um novo produto"""
-    with get_db() as conn:
+async def criar_produto(produto: ProdutoCreate, current_user: User = Depends(get_current_user)):
+    """Criar um novo produto associado ao usuário autenticado"""
+    with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "INSERT INTO produtos (nome, descricao, preco, estoque) VALUES (?, ?, ?, ?)",
-            (produto.nome, produto.descricao, produto.preco, produto.estoque)
+            "INSERT INTO produtos (nome, descricao, preco, estoque, user_id) VALUES (?, ?, ?, ?, ?)",
+            (produto.nome, produto.descricao, produto.preco, produto.estoque, current_user.id)
         )
+        conn.commit()
         produto_id = cursor.lastrowid
         
-        cursor.execute("SELECT * FROM produtos WHERE id = ?", (produto_id,))
+        cursor.execute(
+            "SELECT id, nome, descricao, preco, estoque, user_id FROM produtos WHERE id = ?",
+            (produto_id,)
+        )
         novo_produto = cursor.fetchone()
         
-        return dict(novo_produto)
+        return {
+            "id": novo_produto[0],
+            "nome": novo_produto[1],
+            "descricao": novo_produto[2],
+            "preco": novo_produto[3],
+            "estoque": novo_produto[4],
+            "user_id": novo_produto[5]
+        }
 
 
 @app.put("/produtos/{produto_id}", response_model=Produto)
-async def atualizar_produto(produto_id: int, produto: ProdutoUpdate):
-    """Atualizar um produto existente"""
-    with get_db() as conn:
+async def atualizar_produto(
+    produto_id: int,
+    produto: ProdutoUpdate,
+    current_user: User = Depends(get_current_user)
+):
+    """Atualizar um produto (apenas se pertencer ao usuário)"""
+    with get_db_connection() as conn:
         cursor = conn.cursor()
         
-        # Verificar se o produto existe
-        cursor.execute("SELECT * FROM produtos WHERE id = ?", (produto_id,))
+        # Verificar se o produto existe E pertence ao usuário
+        cursor.execute(
+            "SELECT id, nome, descricao, preco, estoque, user_id FROM produtos WHERE id = ? AND user_id = ?",
+            (produto_id, current_user.id)
+        )
         produto_existente = cursor.fetchone()
         
         if not produto_existente:
-            raise HTTPException(status_code=404, detail="Produto não encontrado")
+            raise HTTPException(
+                status_code=404,
+                detail="Produto não encontrado ou você não tem permissão para editá-lo"
+            )
         
         # Atualizar apenas os campos fornecidos
         updates = []
@@ -186,30 +322,52 @@ async def atualizar_produto(produto_id: int, produto: ProdutoUpdate):
         
         if updates:
             values.append(produto_id)
-            query = f"UPDATE produtos SET {', '.join(updates)} WHERE id = ?"
+            values.append(current_user.id)
+            query = f"UPDATE produtos SET {', '.join(updates)} WHERE id = ? AND user_id = ?"
             cursor.execute(query, values)
+            conn.commit()
         
         # Buscar o produto atualizado
-        cursor.execute("SELECT * FROM produtos WHERE id = ?", (produto_id,))
+        cursor.execute(
+            "SELECT id, nome, descricao, preco, estoque, user_id FROM produtos WHERE id = ?",
+            (produto_id,)
+        )
         produto_atualizado = cursor.fetchone()
         
-        return dict(produto_atualizado)
+        return {
+            "id": produto_atualizado[0],
+            "nome": produto_atualizado[1],
+            "descricao": produto_atualizado[2],
+            "preco": produto_atualizado[3],
+            "estoque": produto_atualizado[4],
+            "user_id": produto_atualizado[5]
+        }
 
 
 @app.delete("/produtos/{produto_id}", status_code=204)
-async def deletar_produto(produto_id: int):
-    """Deletar um produto"""
-    with get_db() as conn:
+async def deletar_produto(produto_id: int, current_user: User = Depends(get_current_user)):
+    """Deletar um produto (apenas se pertencer ao usuário)"""
+    with get_db_connection() as conn:
         cursor = conn.cursor()
         
-        # Verificar se o produto existe
-        cursor.execute("SELECT * FROM produtos WHERE id = ?", (produto_id,))
+        # Verificar se o produto existe E pertence ao usuário
+        cursor.execute(
+            "SELECT id FROM produtos WHERE id = ? AND user_id = ?",
+            (produto_id, current_user.id)
+        )
         produto = cursor.fetchone()
         
         if not produto:
-            raise HTTPException(status_code=404, detail="Produto não encontrado")
+            raise HTTPException(
+                status_code=404,
+                detail="Produto não encontrado ou você não tem permissão para deletá-lo"
+            )
         
-        cursor.execute("DELETE FROM produtos WHERE id = ?", (produto_id,))
+        cursor.execute(
+            "DELETE FROM produtos WHERE id = ? AND user_id = ?",
+            (produto_id, current_user.id)
+        )
+        conn.commit()
         
         return None
 

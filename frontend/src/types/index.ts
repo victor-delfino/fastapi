@@ -1,9 +1,10 @@
 export interface Produto {
   id: number;
   nome: string;
-  descricao: string | null;
+  descricao?: string;
   preco: number;
   estoque: number;
+  user_id: number;
 }
 
 export interface ProdutoCreate {
